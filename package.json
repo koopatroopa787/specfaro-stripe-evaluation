@@ -1,0 +1,9 @@
+{
+  "name": "specfaro-stripe-evaluation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node --check src/payment-intent.js",
+    "test": "node --test"
+  }
+}
