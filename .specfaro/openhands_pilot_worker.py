@@ -27,7 +27,7 @@ from openhands.tools.terminal import TerminalTool
 from case_agent import _baseline, _summary
 from case_cli import read_code
 from case_repair import MAX_FILES, prepare_case, verify_case
-from failure_intake import IntakeError, derive_intake, fetch_failed_log, validate_event
+from failure_intake import IntakeError, MAX_LOG_BYTES, derive_intake, fetch_failed_log, validate_event
 from official_docs_tool import CATALOG, OfficialDocsTool, _get
 from verify import _copy_project, _git_apply, _run_command
 
@@ -211,11 +211,13 @@ def _feedback(verification: dict) -> str:
 
 
 def run(project: Path, repository: str, run_id: int, event: dict,
-        output: Path, api_key: str) -> dict:
+        output: Path, api_key: str, failed_log: str | None = None) -> dict:
     base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project,
                                        text=True, timeout=15).strip()
     validate_event(event, repository, run_id, base_sha)
-    intake = derive_intake(project, repository, run_id, fetch_failed_log(repository, run_id))
+    if failed_log is None:
+        failed_log = fetch_failed_log(repository, run_id)
+    intake = derive_intake(project, repository, run_id, failed_log)
     if not intake.version:
         raise IntakeError("No exact provider API version was established")
     # The model's terminal must not inherit the GitHub token or model key.
@@ -348,7 +350,7 @@ def _write(report: dict, output: Path) -> None:
                       f"Build: {checks.get('build', {}).get('status', 'not_run')}",
                       f"Full tests: {checks.get('test', {}).get('status', 'not_run')}",
                       f"Held-out semantic guard: {checks.get('semantic_guard', {}).get('status', 'not_run')}",
-                      "", "No live Shopify store response was checked. Review and merge remain with the repository owner."])
+                      "", "No live provider response was checked. Review and merge remain with the repository owner."])
     (output / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if report["status"] == "validated_locally":
         patch = report["attempts"][-1]["proposal"]["diff"].encode("utf-8")
@@ -367,6 +369,8 @@ def main() -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--workflow-run", type=int, required=True)
     parser.add_argument("--event-file", type=Path, required=True)
+    parser.add_argument("--failed-log-file", type=Path,
+                        help="Pre-fetched bounded CI log; avoids a GitHub token in the agent step")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     key = os.environ.pop("DEEPSEEK_API_KEY", "")
@@ -374,7 +378,14 @@ def main() -> int:
         parser.error("DEEPSEEK_API_KEY is unavailable")
     try:
         event = json.loads(args.event_file.read_text(encoding="utf-8"))
-        report = run(args.project, args.repository, args.workflow_run, event, args.output, key)
+        failed_log = None
+        if args.failed_log_file:
+            if (not args.failed_log_file.is_file() or args.failed_log_file.is_symlink()
+                    or not 0 < args.failed_log_file.stat().st_size <= MAX_LOG_BYTES):
+                raise IntakeError("Pre-fetched CI output is unavailable or exceeds the intake limit")
+            failed_log = args.failed_log_file.read_text(encoding="utf-8", errors="replace")
+        report = run(args.project, args.repository, args.workflow_run, event, args.output,
+                     key, failed_log=failed_log)
     except IntakeError as exc:
         report = {"status": "intake_abstained", "repository": args.repository,
                   "run_id": args.workflow_run, "reason": str(exc)}

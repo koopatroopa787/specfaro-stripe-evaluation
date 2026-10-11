@@ -46,17 +46,26 @@ jobs:
           unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
       - name: Install pinned OpenHands SDK
         run: python -m pip install 'openhands-sdk==1.54.0' 'openhands-tools==1.54.0'
+      - name: Collect bounded failed CI log
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view "${{ github.event.workflow_run.id }}" --repo "$GITHUB_REPOSITORY" \
+            --log-failed > "$RUNNER_TEMP/specfaro-failed.log"
+          test -s "$RUNNER_TEMP/specfaro-failed.log"
+          test "$(wc -c < "$RUNNER_TEMP/specfaro-failed.log")" -le 200000
       - name: Reproduce, repair, and independently verify
         shell: bash
         env:
           PYTHONPATH: ${{ runner.temp }}/kit/specfaro-local-kit
-          GH_TOKEN: ${{ github.token }}
           DEEPSEEK_API_KEY: ${{ secrets.SPECFARO_DEEPSEEK_API_KEY }}
         run: |
           python .specfaro/openhands_pilot_worker.py . \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-run "${{ github.event.workflow_run.id }}" \
             --event-file "$GITHUB_EVENT_PATH" \
+            --failed-log-file "$RUNNER_TEMP/specfaro-failed.log" \
             --output "$RUNNER_TEMP/specfaro-result"
       - name: Summarize evaluation
         shell: bash
@@ -84,7 +93,9 @@ jobs:
 
   propose:
     needs: repair
-    if: needs.repair.outputs.validated == 'true'
+    if: >-
+      (needs.repair.outputs.validated == 'true' &&
+       vars.SPECFARO_OPENHANDS_PUBLISH_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
