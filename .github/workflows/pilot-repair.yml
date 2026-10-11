@@ -91,10 +91,77 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  propose:
+  verify:
     needs: repair
+    if: needs.repair.outputs.validated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      verified: ${{ steps.result.outputs.verified }}
+      patch_sha256: ${{ steps.result.outputs.patch_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.repair.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: specfaro-pilot-result
+          path: ${{ runner.temp }}/specfaro-result
+      - name: Download pinned verifier dependency
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --max-time 30 \
+            https://dotte.duckdns.org/specfaro-local-kit.zip -o "$RUNNER_TEMP/kit.zip"
+          echo '6cd1c58651051d994ef7c0bb6fe56d712b106a0c6ec79d36acc6806d408f5a9d  '"$RUNNER_TEMP/kit.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
+      - name: Collect failed CI log for independent intake
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view "${{ github.event.workflow_run.id }}" --repo "$GITHUB_REPOSITORY" \
+            --log-failed > "$RUNNER_TEMP/specfaro-failed.log"
+          test -s "$RUNNER_TEMP/specfaro-failed.log"
+          test "$(wc -c < "$RUNNER_TEMP/specfaro-failed.log")" -le 200000
+      - name: Replay patch and held-out checks in fresh runner
+        shell: bash
+        env:
+          PYTHONPATH: ${{ runner.temp }}/kit/specfaro-local-kit
+          BASE_SHA: ${{ needs.repair.outputs.base_sha }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python .specfaro/openhands_reverify.py . "$RUNNER_TEMP/specfaro-result" \
+            --repository "$GITHUB_REPOSITORY" --base-sha "$BASE_SHA" \
+            --failed-run-id "$FAILED_RUN_ID" --event-file "$GITHUB_EVENT_PATH" \
+            --failed-log-file "$RUNNER_TEMP/specfaro-failed.log" \
+            --output "$RUNNER_TEMP/specfaro-independent-verification.json"
+      - name: Record independent proof
+        id: result
+        shell: bash
+        run: |
+          echo "patch_sha256=$(sha256sum "$RUNNER_TEMP/specfaro-result/candidate.patch" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo 'verified=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: specfaro-independent-verification
+          path: ${{ runner.temp }}/specfaro-independent-verification.json
+          retention-days: 7
+
+  propose:
+    needs: [repair, verify]
     if: >-
       (needs.repair.outputs.validated == 'true' &&
+       needs.verify.outputs.verified == 'true' &&
        vars.SPECFARO_OPENHANDS_PUBLISH_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -126,6 +193,7 @@ jobs:
           BASE_SHA: ${{ needs.repair.outputs.base_sha }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
           FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          VERIFIED_PATCH_SHA: ${{ needs.verify.outputs.patch_sha256 }}
           PYTHONPATH: ${{ runner.temp }}/kit/specfaro-local-kit
         run: |
           set -euo pipefail
@@ -135,6 +203,7 @@ jobs:
           python .specfaro/openhands_publish.py . "$RUNNER_TEMP/specfaro-result" \
             --repository "$GITHUB_REPOSITORY" --base-sha "$BASE_SHA" \
             --failed-run-id "$FAILED_RUN_ID"
+          test "$(sha256sum "$RUNNER_TEMP/specfaro-result/candidate.patch" | cut -d' ' -f1)" = "$VERIFIED_PATCH_SHA"
           git apply --check --whitespace=error \
             "$RUNNER_TEMP/specfaro-result/candidate.patch"
           git apply --whitespace=error \
