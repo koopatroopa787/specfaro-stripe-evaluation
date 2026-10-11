@@ -20,6 +20,7 @@ import urllib.parse
 
 from pydantic import SecretStr
 from openhands.sdk import Agent, Conversation, LLM
+from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.tool import Tool
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
@@ -45,6 +46,18 @@ NOISE_SYMBOLS = {"TestContext", "TypeError", "GitHub", "Subtest", "failureType",
 
 class PromptBudgetReached(RuntimeError):
     """Stop before another model request would exceed the pilot token allowance."""
+
+
+def _is_prompt_budget_error(exc: BaseException) -> bool:
+    """OpenHands wraps exceptions from an LLM completion in ConversationRunError."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, PromptBudgetReached):
+            return True
+        seen.add(id(exc))
+        exc = (exc.original_exception if isinstance(exc, ConversationRunError)
+               else exc.__cause__)
+    return False
 
 
 class BudgetedLLM(LLM):
@@ -281,8 +294,11 @@ def run(project: Path, repository: str, run_id: int, event: dict,
             for number in range(1, MAX_ATTEMPTS + 1):
                 try:
                     conv.run()
-                except PromptBudgetReached:
-                    report["status"] = "budget_exhausted"
+                except (PromptBudgetReached, ConversationRunError) as exc:
+                    if not _is_prompt_budget_error(exc):
+                        raise
+                    report.update(status="budget_exhausted",
+                                  reason="Projected prompt token budget reached before another model call")
                     break
                 candidate = _candidate(before, _snapshot(workspace), focus)
                 evidence, evidence_ok = _source_evidence(
@@ -338,6 +354,11 @@ def _write(report: dict, output: Path) -> None:
              "Publication requires a separate artifact check; the repository owner reviews and merges the draft PR."]
     if report.get("reason"):
         lines.append("Reason: " + report["reason"])
+    usage = report.get("model_usage")
+    if usage:
+        lines.extend([f"Model calls: {usage['calls']}",
+                      f"Prompt tokens: {usage['prompt_tokens']}",
+                      f"Completion tokens: {usage['completion_tokens']}"])
     for source in report.get("sources", []):
         lines.append(f"Official source: {source['url']} (SHA-256 {source['sha256']})")
     if report.get("attempts"):
