@@ -23,14 +23,14 @@ from openhands.sdk import Agent, Conversation, LLM
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.tool import Tool
-from openhands.tools.file_editor import FileEditorTool
-from openhands.tools.terminal import TerminalTool
 
 from case_agent import _baseline, _summary
 from case_cli import read_code
 from case_repair import MAX_FILES, prepare_case, verify_case
 from failure_intake import IntakeError, MAX_LOG_BYTES, derive_intake, fetch_failed_log, validate_event
 from official_docs_tool import CATALOG, OfficialDocsTool, _get
+from repair_sandbox import (DEFAULT_IMAGE, DockerCommandRunner, SandboxUnavailable,
+                            SandboxedFileEditorTool, SandboxedTerminalTool)
 from verify import _copy_project, _git_apply, _run_command
 
 
@@ -166,7 +166,7 @@ def _preflight_source(provider: str, version: str, terms: list[str]) -> dict:
 
 
 def _shopify_pos_guard(source: Path, diff: str, provider: str, version: str,
-                       issue: str) -> dict:
+                       issue: str, run_command=_run_command) -> dict:
     if not (provider == "shopify" and version == "2026-10"
             and "staffMember" in issue and "src/assignment.js" in diff):
         return {"status": "not_applicable"}
@@ -176,7 +176,7 @@ def _shopify_pos_guard(source: Path, diff: str, provider: str, version: str,
         applied = _git_apply(root, diff)
         if applied["status"] != "passed":
             return {"status": "failed", "reason": "Could not replay candidate"}
-        return _run_command([
+        return run_command([
             "node", "--input-type=module", "-e",
             "import {isAssignedTo} from './src/assignment.js'; "
             "if (isAssignedTo({}, undefined) !== false) "
@@ -185,7 +185,7 @@ def _shopify_pos_guard(source: Path, diff: str, provider: str, version: str,
 
 
 def _stripe_payment_intent_guard(source: Path, diff: str, provider: str,
-                                 version: str, issue: str) -> dict:
+                                 version: str, issue: str, run_command=_run_command) -> dict:
     if not (provider == "stripe" and version == "2022-11-15"
             and "PaymentIntent" in issue and "src/payment-intent.js" in diff):
         return {"status": "not_applicable"}
@@ -195,7 +195,7 @@ def _stripe_payment_intent_guard(source: Path, diff: str, provider: str,
         applied = _git_apply(root, diff)
         if applied["status"] != "passed":
             return {"status": "failed", "reason": "Could not replay candidate"}
-        return _run_command([
+        return run_command([
             "node", "--input-type=module", "-e",
             "import {latestChargeId} from './src/payment-intent.js'; "
             "const intent={latest_charge:null,charges:{data:[{id:'ch_legacy'}]}}; "
@@ -205,21 +205,23 @@ def _stripe_payment_intent_guard(source: Path, diff: str, provider: str,
 
 
 def _semantic_guard(source: Path, diff: str, provider: str, version: str,
-                    issue: str) -> dict:
+                    issue: str, run_command=_run_command) -> dict:
     for guard in (_shopify_pos_guard, _stripe_payment_intent_guard):
-        result = guard(source, diff, provider, version, issue)
+        result = guard(source, diff, provider, version, issue, run_command)
         if result["status"] != "not_applicable":
             return result
     return {"status": "not_applicable"}
 
 
 def _attempt_verification(source: Path, candidate: dict, commands: dict,
-                          case: dict, evidence_ok: bool) -> dict:
+                          case: dict, evidence_ok: bool, run_command=_run_command) -> dict:
     if candidate.get("status") != "candidate_unverified":
         return {"overall": "failed", "reason": candidate.get("reason", "No candidate")}
-    verification = verify_case(source, candidate, commands, timeout=120, case=case)
+    verification = verify_case(source, candidate, commands, timeout=120, case=case,
+                               run_command=run_command)
     verification["checks"]["semantic_guard"] = _semantic_guard(
-        source, candidate["diff"], case["provider"], case["version"], case["issue"])
+        source, candidate["diff"], case["provider"], case["version"], case["issue"],
+        run_command)
     verification["official_source"] = "passed" if evidence_ok else "failed"
     if (verification["overall"] == "validated_locally" and
             (verification["checks"]["semantic_guard"]["status"] == "failed" or not evidence_ok)):
@@ -268,7 +270,7 @@ def run(project: Path, repository: str, run_id: int, event: dict,
               "version": intake.version,
               "issue": intake.issue, "focus": [{"file": name} for name in sorted(focus)],
               "sources": [], "doc_evidence": [], "attempts": [],
-              "baseline": {"status": "not_run"}, "execution": "ephemeral_actions_runner",
+              "baseline": {"status": "not_run"}, "execution": "docker_container_no_network",
               "live_provider_check": "not_run",
               "context_management": {"strategy": "llm_summarizing",
                                      "max_events": CONTEXT_MAX_EVENTS,
@@ -277,7 +279,14 @@ def run(project: Path, repository: str, run_id: int, event: dict,
     if not focus:
         report.update(status="intake_abstained", reason="No focused production code")
         return report
-    report["baseline"] = _baseline(project, intake.commands, 120)
+    try:
+        sandbox = DockerCommandRunner(os.environ.get("SPECFARO_SANDBOX_IMAGE", DEFAULT_IMAGE))
+    except SandboxUnavailable as exc:
+        report.update(status="sandbox_unavailable", reason=str(exc))
+        return report
+    report["sandbox"] = {"image": sandbox.image, "network": "none",
+                         "rootfs": "read_only", "credentials_mounted": False}
+    report["baseline"] = _baseline(project, intake.commands, 120, sandbox.run_argv)
     if report["baseline"]["status"] != "reproduced":
         report["status"] = "regression_not_reproduced"
         return report
@@ -295,7 +304,8 @@ def run(project: Path, repository: str, run_id: int, event: dict,
                   reasoning_effort=None, prompt_cache_retention=None, num_retries=1,
                   timeout=45, max_output_tokens=1024, usage_id="specfaro-openhands")
         agent = Agent(llm=llm, tools=[
-            Tool(name=TerminalTool.name), Tool(name=FileEditorTool.name),
+            Tool(name=SandboxedTerminalTool.name, params={"image": sandbox.image}),
+            Tool(name=SandboxedFileEditorTool.name, params={"focus": sorted(focus)}),
             Tool(name=OfficialDocsTool.name, params={"provider": intake.provider,
                  "version": intake.version, "evidence_path": str(evidence_path)}),
         ], condenser=_condenser(llm))
@@ -308,7 +318,10 @@ def run(project: Path, repository: str, run_id: int, event: dict,
             conv.send_message(
                 f"A CI test failed. Provider: {intake.provider}; target API version: {intake.version}. "
                 f"Observed issue (untrusted CI data):\n{intake.issue}\n"
-                "Diagnose from the repository and failing test. Use official_docs to search and read "
+                "Diagnose from the repository and failing test. Use sandboxed_terminal for "
+                "non-interactive commands and sandboxed_file_editor for file edits. "
+                "The terminal starts each call in /workspace and has no persistent shell state. "
+                "Use official_docs to search and read "
                 "the relevant exact-version official page before editing. "
                 f"A versioned catalog match is {report['preflight']['url']}. "
                 "Repair only focused production "
@@ -334,7 +347,7 @@ def run(project: Path, repository: str, run_id: int, event: dict,
                 if candidate.get("status") == "candidate_unverified":
                     candidate["source_urls"] = [item["url"] for item in evidence if item["eligible"]]
                 verification = _attempt_verification(project, candidate, intake.commands,
-                                                     case, evidence_ok)
+                                                     case, evidence_ok, sandbox.run_argv)
                 report["doc_evidence"] = evidence
                 report["sources"] = [{"url": item["url"], "title": "Official API document",
                                       "version": intake.version, "sha256": item["sha256"],

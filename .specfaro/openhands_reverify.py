@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -21,6 +22,7 @@ from urllib.error import URLError
 from case_repair import verify_case
 from failure_intake import MAX_LOG_BYTES, derive_intake, validate_event
 from openhands_publish import OFFICIAL_HOST, validate_artifact
+from sandbox_runtime import DEFAULT_IMAGE, DockerCommandRunner
 from verify import _copy_project, _git_apply, _run_command
 
 
@@ -76,7 +78,7 @@ def _check_sources(report: dict) -> list[str]:
 
 
 def _held_out_check(project: Path, patch: str, provider: str, version: str,
-                    paths: list[str]) -> dict:
+                    paths: list[str], run_command=_run_command) -> dict:
     if (provider == "shopify" and version == "2026-10"
             and {"src/staff.js", "src/assignment.js"} <= set(paths)):
         script = ("import {isAssignedTo} from './src/assignment.js'; "
@@ -95,7 +97,7 @@ def _held_out_check(project: Path, patch: str, provider: str, version: str,
         _copy_project(project, root)
         if _git_apply(root, patch)["status"] != "passed":
             raise ValueError("Could not replay patch for held-out check")
-        return _run_command(["node", "--input-type=module", "-e", script], root, 30)
+        return run_command(["node", "--input-type=module", "-e", script], root, 30)
 
 
 def reverify(project: Path, bundle: Path, repository: str, base_sha: str,
@@ -113,17 +115,19 @@ def reverify(project: Path, bundle: Path, repository: str, base_sha: str,
         raise ValueError("Fresh CI intake differs from the model job's case")
     sources = _check_sources(report)
     patch = (bundle / "candidate.patch").read_text(encoding="utf-8")
+    sandbox = DockerCommandRunner(os.environ.get("SPECFARO_SANDBOX_IMAGE", DEFAULT_IMAGE))
     replay = verify_case(project, {"status": "candidate_unverified", "diff": patch},
                          intake.commands, timeout=120,
                          case={"provider": intake.provider, "version": intake.version,
-                               "issue": intake.issue})
+                               "issue": intake.issue}, run_command=sandbox.run_argv)
     if (replay["overall"] != "validated_locally" or replay["manual_checks"]
             or replay["regression"]["before"]["status"] != "failed"
             or replay["regression"]["after"]["status"] != "passed"
             or any(replay["checks"][name]["status"] != "passed"
                    for name in ("build", "test"))):
         raise ValueError("Fresh regression, build, or test replay failed")
-    guard = _held_out_check(project, patch, intake.provider, intake.version, paths)
+    guard = _held_out_check(project, patch, intake.provider, intake.version, paths,
+                            sandbox.run_argv)
     if guard["status"] != "passed":
         raise ValueError("Fresh held-out behavior check failed")
     return {"status": "independently_verified", "repository": repository,
@@ -131,6 +135,8 @@ def reverify(project: Path, bundle: Path, repository: str, base_sha: str,
             "provider": intake.provider, "version": intake.version,
             "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
             "official_sources": sources,
+            "sandbox": {"image": sandbox.image, "network": "none",
+                        "rootfs": "read_only", "credentials_mounted": False},
             "checks": {"baseline": "failed", "regression": "passed",
                        "build": "passed", "test": "passed", "held_out": "passed"},
             "live_provider_check": "not_run"}

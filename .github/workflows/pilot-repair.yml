@@ -37,6 +37,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Pin sandbox image before loading the model key
+        shell: bash
+        run: |
+          docker pull node:22-bookworm-slim
+          image="$(docker image inspect node:22-bookworm-slim --format '{{index .RepoDigests 0}}')"
+          test -n "$image"
+          echo "SPECFARO_SANDBOX_IMAGE=$image" >> "$GITHUB_ENV"
       - name: Download pinned Specfaro worker
         shell: bash
         run: |
@@ -113,6 +120,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Pin verifier sandbox image
+        shell: bash
+        run: |
+          docker pull node:22-bookworm-slim
+          image="$(docker image inspect node:22-bookworm-slim --format '{{index .RepoDigests 0}}')"
+          test -n "$image"
+          echo "SPECFARO_SANDBOX_IMAGE=$image" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: specfaro-pilot-result
