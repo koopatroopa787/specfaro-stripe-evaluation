@@ -63,15 +63,19 @@ class DockerCommandRunner:
                                timeout=10, check=False)
             except (OSError, subprocess.TimeoutExpired) as cleanup_error:
                 raise SandboxUnavailable("Timed-out sandbox could not be removed") from cleanup_error
-            return {"status": "failed", "reason": f"Timed out after {timeout} seconds",
+            return {"status": "timeout", "reason": f"Timed out after {timeout} seconds",
                     "seconds": round(time.monotonic() - started, 2),
                     "stdout": str(exc.stdout or "")[-MAX_OUTPUT_CHARS:],
                     "stderr": str(exc.stderr or "")[-MAX_OUTPUT_CHARS:]}
         except OSError as exc:
-            return {"status": "failed", "reason": str(exc)[:500],
+            return {"status": "sandbox_error", "reason": str(exc)[:500],
                     "seconds": round(time.monotonic() - started, 2),
                     "stdout": "", "stderr": ""}
-        return {"status": "passed" if result.returncode == 0 else "failed",
+        # Docker reserves these exit codes for launch/runtime failures. Do not
+        # mistake an unavailable sandbox or command for a reproduced test.
+        status = ("passed" if result.returncode == 0 else
+                  "sandbox_error" if result.returncode in {125, 126, 127} else "failed")
+        return {"status": status,
                 "exit_code": result.returncode,
                 "seconds": round(time.monotonic() - started, 2),
                 "stdout": result.stdout[-MAX_OUTPUT_CHARS:],

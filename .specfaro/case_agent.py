@@ -40,7 +40,7 @@ def _baseline(source: Path, commands: dict, timeout: int,
         workspace.mkdir()
         copied = _copy_project(source.resolve(), workspace)
         install = run_command(commands["install"], workspace, timeout) if "install" in commands else {"status": "not_run"}
-        if install["status"] == "failed":
+        if install["status"] != "passed" and "install" in commands:
             return {"status": "setup_failed", "project_copy": copied, "install": _summary(install)}
         regression = run_command(commands["regression"], workspace, timeout)
         return {"status": "reproduced" if regression["status"] == "failed" else "not_reproduced",

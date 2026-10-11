@@ -288,7 +288,9 @@ def run(project: Path, repository: str, run_id: int, event: dict,
                          "rootfs": "read_only", "credentials_mounted": False}
     report["baseline"] = _baseline(project, intake.commands, 120, sandbox.run_argv)
     if report["baseline"]["status"] != "reproduced":
-        report["status"] = "regression_not_reproduced"
+        regression_status = report["baseline"].get("regression", {}).get("status")
+        report["status"] = ("sandbox_unavailable" if regression_status in {"sandbox_error", "timeout"}
+                            else "regression_not_reproduced")
         return report
     report["preflight"] = _preflight_source(intake.provider, intake.version, case["terms"])
     if report["preflight"]["status"] != "matched":
