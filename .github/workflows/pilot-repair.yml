@@ -1,4 +1,6 @@
-name: Specfaro Stripe evaluation
+# Disposable OpenHands pilot. A read-only repair job uploads evidence; a
+# separate job validates the exact artifact before opening a draft PR.
+name: Specfaro Stripe repair
 on:
   workflow_run:
     workflows: ["Specfaro pilot regression"]
@@ -6,14 +8,24 @@ on:
 permissions:
   contents: read
   actions: read
+concurrency:
+  group: specfaro-stripe-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  evaluate:
+  repair:
     if: >-
       (github.event.workflow_run.conclusion == 'failure' &&
        github.event.workflow_run.head_branch == github.event.repository.default_branch &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       vars.SPECFARO_OPENHANDS_EVAL_ENABLED == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      validated: ${{ steps.result.outputs.validated }}
+      base_sha: ${{ steps.result.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,21 +44,102 @@ jobs:
             https://dotte.duckdns.org/specfaro-local-kit.zip -o "$RUNNER_TEMP/kit.zip"
           echo '6cd1c58651051d994ef7c0bb6fe56d712b106a0c6ec79d36acc6806d408f5a9d  '"$RUNNER_TEMP/kit.zip" | sha256sum --check
           unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
-      - name: Reproduce, propose, and validate
+      - name: Install pinned OpenHands SDK
+        run: python -m pip install 'openhands-sdk==1.54.0' 'openhands-tools==1.54.0'
+      - name: Reproduce, repair, and independently verify
         shell: bash
         env:
           PYTHONPATH: ${{ runner.temp }}/kit/specfaro-local-kit
           GH_TOKEN: ${{ github.token }}
+          DEEPSEEK_API_KEY: ${{ secrets.SPECFARO_DEEPSEEK_API_KEY }}
         run: |
-          python "$RUNNER_TEMP/kit/specfaro-local-kit/pilot_worker.py" . \
+          python .specfaro/openhands_pilot_worker.py . \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-run "${{ github.event.workflow_run.id }}" \
             --event-file "$GITHUB_EVENT_PATH" \
             --output "$RUNNER_TEMP/specfaro-result"
+      - name: Summarize evaluation
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/specfaro-result/report.md"; then
+            cat "$RUNNER_TEMP/specfaro-result/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Record candidate state
+        id: result
+        shell: bash
+        run: |
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if test -f "$RUNNER_TEMP/specfaro-result/manifest.json"; then
+            echo "validated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "validated=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: specfaro-stripe-evaluation
+          name: specfaro-pilot-result
           path: ${{ runner.temp }}/specfaro-result/
           if-no-files-found: warn
           retention-days: 7
+
+  propose:
+    needs: repair
+    if: needs.repair.outputs.validated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.repair.outputs.base_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: specfaro-pilot-result
+          path: ${{ runner.temp }}/specfaro-result
+      - name: Download pinned artifact verifier dependency
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --max-time 30 \
+            https://dotte.duckdns.org/specfaro-local-kit.zip -o "$RUNNER_TEMP/kit.zip"
+          echo '6cd1c58651051d994ef7c0bb6fe56d712b106a0c6ec79d36acc6806d408f5a9d  '"$RUNNER_TEMP/kit.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/kit.zip" -d "$RUNNER_TEMP/kit"
+      - name: Validate artifact and publish draft PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.repair.outputs.base_sha }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          PYTHONPATH: ${{ runner.temp }}/kit/specfaro-local-kit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          git fetch origin "refs/heads/$BASE_BRANCH"
+          test "$(git rev-parse FETCH_HEAD)" = "$BASE_SHA"
+          python .specfaro/openhands_publish.py . "$RUNNER_TEMP/specfaro-result" \
+            --repository "$GITHUB_REPOSITORY" --base-sha "$BASE_SHA" \
+            --failed-run-id "$FAILED_RUN_ID"
+          git apply --check --whitespace=error \
+            "$RUNNER_TEMP/specfaro-result/candidate.patch"
+          git apply --whitespace=error \
+            "$RUNNER_TEMP/specfaro-result/candidate.patch"
+          git diff --check
+          branch="specfaro/openhands-$FAILED_RUN_ID"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "Branch already exists; refusing to replace a previous candidate"
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git add -u
+          git commit -m 'Repair Stripe PaymentIntent API regression'
+          git push origin "HEAD:$branch"
+          gh pr create --draft --base "$BASE_BRANCH" --head "$branch" \
+            --title 'Repair Stripe PaymentIntent API regression' \
+            --body-file "$RUNNER_TEMP/specfaro-result/report.md"
