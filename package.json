@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node --check src/payment-intent.js",
-    "test": "node --test"
+    "build": "node --check src/payment-intent.js && node --check src/charge-view.js",
+    "test": "node --test",
+    "test:specfaro-contract": "node --test contract/charge.mjs"
   }
 }
